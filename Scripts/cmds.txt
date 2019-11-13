@@ -31,6 +31,7 @@ aws glacier initiate-job \
 
 #Once the retrieval job is complete, you can retrieve the file:
 #use job id obtained from previous command
+#Any file name can be used for output,in this case file name is file.tar
 aws glacier get-job-output \
   --account-id - \
   --vault-name EGLab_Data \
