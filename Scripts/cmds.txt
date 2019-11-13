@@ -1,4 +1,6 @@
-#List Vaults
+#commands assume config file for credentails has already been configured
+#
+#List Vaults 
 aws glacier list-vaults --account-id -
 
 #uploaded new file TAIR10.tar.gz for testing to labvault for testing
