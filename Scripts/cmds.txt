@@ -1,0 +1,44 @@
+#List Vaults
+aws glacier list-vaults --account-id -
+
+#uploaded new file TAIR10.tar.gz for testing to labvault for testing
+aws glacier upload-archive --account-id - --vault-name labvault --body TAIR10.tar.gz
+
+#check status of vault
+aws glacier describe-vault --account-id - --vault-name {vault name}
+
+#list glacier jobs
+aws glacier list-jobs --account-id - --vault-name EGLab_Data
+
+#get archives in vault
+aws glacier initiate-job --account-id - --vault-name EGLab_Data --job-parameters '{"Type": "inventory-retrieval"}'
+
+#get output of inventory retrieval using the job id 
+#store output in file called glacier-jobs-out
+aws glacier get-job-output \
+  --account-id - \
+  --vault-name EGLab_Data \
+  --job-id "j6ig7qCeJ4Ortc-D83EgHsNxm3RriaAkyEFma3_dx_TV_xix5_APExmpGrDLT7EU07Wxc_5BQfwllggqsgH_JfLusxIV" \
+  glacier-jobs-out
+
+#retrieve an archive
+#reference JSON file create by user
+aws glacier initiate-job \
+  --account-id - \
+  --vault-name EGLab_Data \
+  --job-parameters file://archive-retrival.json
+
+
+#Once the retrieval job is complete, you can retrieve the file:
+#use job id obtained from previous command
+aws glacier get-job-output \
+  --account-id - \
+  --vault-name EGLab_Data \
+  --job-id "xGvIJyQPC9weheMNwIf4s2z8Zct1lYGvjzdxz84VwhD-OaGtCRPwLCAGdr5c_m3qadoOkMGo-FYaLJ5psLKhhcFDjC1n" \
+  file.tar
+
+
+
+
+#reference
+ref:https://www.madboa.com/blog/2016/09/23/glacier-cli-intro/
