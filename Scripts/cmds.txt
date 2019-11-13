@@ -1,4 +1,6 @@
-#List Vaults
+#commands assume config file for credentails has already been configured
+#
+#List Vaults 
 aws glacier list-vaults --account-id -
 
 #uploaded new file TAIR10.tar.gz for testing to labvault for testing
@@ -31,6 +33,7 @@ aws glacier initiate-job \
 
 #Once the retrieval job is complete, you can retrieve the file:
 #use job id obtained from previous command
+#Any file name can be used for output,in this case file name is file.tar
 aws glacier get-job-output \
   --account-id - \
   --vault-name EGLab_Data \
