@@ -1,0 +1,1279 @@
+#!/bin/bash
+
+# upload-glacier
+#
+# Shell script to automate uploading large files to AWS Glacier
+# Latest at http://www.mudeth.org/latest/upload-glacier
+# Docs at   http://www.mudeth.org/post/upload-glacier
+#
+# Written for Raspberry Pi
+# Tested on Raspbian Jessie
+#
+# Copyright (c) Abhijit Shylanath, 2016; MIT license
+# https://opensource.org/licenses/MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+# IN THE SOFTWARE.
+#
+# Requires
+#
+#   aws                     sudo pip install awscli; aws configure
+#   python                  2.7 tested
+#   calc-sha256-treehash    From http://unixtastic.com/content/sha256-treehash-calculator
+#
+#   python libs:            psutil, netaddr
+#
+# Uses external scripts
+#   _TREE_HASH_CMD              To calculate sha256-treehash
+#   _STAT_SRV_CMD               To run HTTP server that displays progress
+#
+
+# Constants and such-as, like #########################
+#
+_UG_VERSION="0.4.1b"                                    # Version code
+_UG_DATE="2016-04-03"                                   # Version date
+
+_USAGE_TEXT="\
+Usage: upload-glacier [OPTIONS] <file> [file] [...]
+
+Options:
+-a <aws>    Use alternate aws command
+-c <size>   Use specified chunk size
+-C <file>   Use specified config file
+-e          Send e-mail on completion (see -n)
+-E          Test environment and exit
+-G          Generate config file (interactive)
+-l          List current settings and exit
+-n          Don't send e-mail on completion (see -e)
+-t <dir>    Use alternate temporary directory
+-r          Run recovery
+-v          Print version and exit
+-V <vault>  Use specified vault
+
+Web: http://www.mudeth.org/post/upload-glacier
+"
+_RUN_DATE=`date`
+
+# Stuff you may need to change
+
+# Sane defaults
+
+_SANE_TEMP_DIR="/var/tmp/upload-glacier"
+_SANE_CHUNK_SIZE=16777216
+_SANE_STAT_SRV_PORT=8080
+_SANE_MAIL_CMD="printf -- \$t | mail -s \$s root"
+_SANE_AWS_CMD="aws"
+
+# Declarations, I just like to have 'em
+
+_TEMP_DIR=""                                            # No trailing slash
+_VAULT_NAME=""                                          # Vault name in Glacier
+_TREE_HASH_CMD=""                                       # See file header
+_STAT_SRV_CMD=""                                        # Micro HTTP server to monitor status remotely
+_STAT_SRV_PORT=""                                       # Port for the server
+_MAIL_CMD=""                                            # Script/program that mails user, $s for subject, $t for text, automatically quoted
+
+_OVERWRITE_TEMPS=0                                      # 1 - overwrite split files (avoid)
+_DO_EMAIL=1                                             # Whether to send e-mail (1) or not (0)
+
+_CONFIG_FILE=~/.upload-glacier/settings.conf            # Always loaded first, even with -C
+
+_LIVE_LOG=""                                            # As it's happening
+_LIVE_STATS=""                                          # For web server
+_REPLY_FILE=""                                          # AWS JSON reply is stored here temporarily to parse
+_FAIL_LOG=""                                            # To log failed chunks for recovery later
+_AWS_LOG=""                                             # Replies from AWS are logged here
+_STAT_SRV_LOG=""                                        # HTTP server will log here
+
+_AWS_CMD=""                                             # Should be 'aws', only for debugging
+_CHUNK_SIZE=""                                          # In bytes. Must be 1048576 * 2^n. eg: 2097152, 4194304... up to 4096 MiB
+                                                        # Smaller sizes will cost more, because Glacier charges
+# Not toggles; used internally
+
+_LIVE_LOG_ON=0                                          # Turned on after sanity check
+_RECOVERY=0                                             # Run in recovery mode
+
+# Globals and et-al ect ###############################
+#
+
+_MAIL_TEXT=""           # text to be sent by e-mail, at exit
+_STAT_SRV_PID=0         # PID of status server duh
+
+# Functions be like ###################################
+#
+
+function add_log {
+    # Prints to screen and adds to message log (only of _LIVE_LOG_ON is true)
+    # <arg> [arg] [...]
+
+    printf -- "$*"
+    _MAIL_TEXT+="$*"
+    if [[ "$_LIVE_LOG_ON" -ne 0 && ! -z "$_LIVE_LOG" ]]; then
+        printf -- "$*" >> "$_LIVE_LOG"
+    fi
+}
+
+function add_log_bytes {
+    # Prints bytes to screen and log in friendly format
+    # <size in bytes>
+
+    if [ ! -z "$1" ]; then
+        _STR=""
+        _NUM=$1
+
+        if [ $_NUM -eq 0 ]; then
+        # Special case
+            add_log "0"
+            return
+        fi
+
+        # Keep dividing by 1000 until
+        while [ $_NUM -ge 1000 ]; do
+            (( _TMP_NUM = $_NUM % 1000 ))
+            if [ -z "$_STR" ]; then
+                _STR=$(printf "%03d" $_TMP_NUM)
+            else
+                _STR=$(printf "%03d,%s" $_TMP_NUM "$_STR")
+            fi
+            (( _NUM = $_NUM / 1000 ))
+        done
+
+        if [ -z "$_STR" ]; then
+            # Was less than 1000, so $_STR is empty
+            _STR="$_NUM"
+        else
+            _STR="$_NUM,$_STR"
+        fi
+
+        add_log "$_STR"
+    fi
+}
+
+function start_stat_srv {
+    # Starts status server on configured port, saved PID
+    # No arguments
+
+    if [ $_STAT_SRV_PID -ne 0 ]; then
+        # Already running?
+        return
+    fi
+
+    if [ ! -x "$_STAT_SRV_CMD" ]; then
+        # Can't find server/not executable?
+        add_log "*WARNING*\tcould not find stat server/not executable\n"
+        return
+    fi
+
+    "$_STAT_SRV_CMD" "$_STAT_SRV_PORT" "$_LIVE_STATS" "$_LIVE_LOG" "$$" >"$_STAT_SRV_LOG" &
+    if [ $? -ne 0 ]; then
+        # Error starting server
+        add_log "*WARNING*\tcould not start stat server $_STAT_SRV_CMD\n"
+        return
+    fi
+
+    _STAT_SRV_PID=$!
+    add_log "Check status on $HOSTNAME:$_STAT_SRV_PORT\n"
+}
+
+function update_stats {
+    # Updates stats file for status server to read
+    # <runstatus> <filename> <file_n_of..> <..total_files> <filesize> <UID> <chunk_n_of..> <..total_chunks>
+    # Format of the file is
+    #
+    # <rsrv>    #unused
+    # n/N       #files
+    # filename
+    # filesize  #bytes
+    # upload_id
+    # n/N       #chunks
+
+    if [ $# -ne 8 ]; then
+        add_log "\nINTERNAL FAULT: update_stats expects 8 arguments, got $#\n"
+        exit 255
+    fi
+
+    echo "$1"                   > "$_LIVE_STATS"    # runstatus
+    printf "%d/%d\n" "$3" "$4"  >> "$_LIVE_STATS"   # file n/N
+    echo "$2"                   >> "$_LIVE_STATS"   # filename
+    echo "$5"                   >> "$_LIVE_STATS"   # filesize
+    echo "$6"                   >> "$_LIVE_STATS"   # UID
+    printf "%d/%d\n" "$7" "$8"  >> "$_LIVE_STATS"   # chunk n/N
+}
+
+function num_in_range {
+    # Validates that provided argument is:
+    # <number> <range_low> <range_hi>
+    #   a number
+    #   in specified range (inclusive)
+    #
+    # Returns   0 for success
+    #           255 for not number
+    #           -1 for less than range_low
+    #           1 for more than range_hi
+
+    if [[ ! "$1" =~ ^[0-9]+$ ]]; then
+        # Not a number
+        return 255
+    fi
+
+    if [ "$1" -lt "$2" ]; then
+        # Lower bound breached
+        return -1
+    fi
+
+    if [ "$1" -gt "$3" ]; then
+        # Upper bound breached
+        return 1
+    fi
+
+    return 0
+}
+
+function generate_description {
+    # Generates XML metadata compatible with FastGlacier format v4
+    # Prints to STDOUT
+    # https://fastglacier.com/fastglacier-metadata-format.aspx
+    # <filename> <filesize>
+
+    if [ $# -ne 2 ]; then
+        add_log "\nINTERNAL FAULT: generate_description expects 2 arguments, got $#\n"
+        exit 255
+    fi
+
+    # Filename is saved as base64(utf8(filename))
+    _FILE_PATH=`printf -- "%s" "$1" | awk -F / '{ printf "%s", $NF }' | recode ascii..utf8 | base64 -w 0`
+    # Last modified as yyyyMMdd\THHmmss\Z
+    _UTC_LASTMODIFIED=$(date -d @`stat -c %Y "$1"` "+%Y%m%dT%H%M%SZ")
+    _FILE_HASH=`md5sum "$1" | cut -d ' ' -f 1`
+
+    # Print it out
+    printf "<m><v>4</v><p>$_FILE_PATH</p><lm>$_UTC_LASTMODIFIED</lm><ce>0:0:$_FILE_HASH:$2</ce></m>"
+}
+
+function print_line_num {
+    # Prints config file, line number if set
+    # Helper for set_config_option
+    # [line_num]
+
+    if [ -z "$1" ]; then
+        # No line number supplied, print nothing
+        return
+    fi
+
+    add_log "In $_CONFIG_FILE, line $1:\n"
+}
+
+function set_config_option {
+    # Sets config option with validation
+    # Expects format 'setting=value'
+    # On error, reports and exits (prints line_num if specified)
+    # <setting_string> [line_num]
+
+    # Get $setting=$value
+    setting=$(printf "$1" | cut -d '=' -f 1)
+    value=$(printf "$1" | cut -d '=' -f 2-)
+#    echo "Attempting to set '$setting' to '$value'"
+
+    case "$setting" in
+        temp_dir)
+            _TEMP_DIR="$value"
+
+            # Generate necessary names from this
+            _LIVE_LOG="${_TEMP_DIR}/live_log"
+            _LIVE_STATS="${_TEMP_DIR}/.live_stats"
+            _REPLY_FILE="${_TEMP_DIR}/.aws_last_reply"
+            _FAIL_LOG="${_TEMP_DIR}/failed_chunks"
+            _AWS_LOG="${_TEMP_DIR}/aws.log"
+            _STAT_SRV_LOG="${_TEMP_DIR}/stat_srv.log"
+            ;;
+
+        vault_name)
+            _VAULT_NAME="$value"
+            ;;
+
+        tree_hash_cmd)
+            _TREE_HASH_CMD="$value"
+            ;;
+
+        stat_srv_cmd)
+            _STAT_SRV_CMD="$value"
+            ;;
+
+        stat_srv_port)
+            num_in_range "$value" 1 65535
+            if [ $? -ne 0 ]; then
+                print_line_num "$2"
+                add_log "*FATAL*\t\tInvalid port for $setting: '$value'\n"
+                exit 252
+            fi
+            _STAT_SRV_PORT="$value"
+            ;;
+
+        mail_cmd)
+            _MAIL_CMD="$value"
+            ;;
+
+        overwrite_temps)
+            num_in_range "$value" 0 1
+            if [ $? -ne 0 ]; then
+                print_line_num "$2"
+                add_log "*FATAL*\t\tConfiguration option 'overwrite_temps' should be 0 or 1 (is '$value')\n"
+                exit 252
+            fi
+            _OVERWRITE_TEMPS="$value"
+            ;;
+
+        do_email)
+            num_in_range "$value" 0 1
+            if [ $? -ne 0 ]; then
+                print_line_num "$2"
+                add_log "*FATAL*\t\tConfiguration option 'do_email' should be 0 or 1 (is '$value')\n"
+                exit 252
+            fi
+            _DO_EMAIL="$value"
+            ;;
+
+        live_log)
+            _LIVE_LOG="$value"
+            ;;
+
+        live_stats)
+            _LIVE_STATS="$value"
+            ;;
+
+        reply_file)
+            _REPLY_FILE="$value"
+            ;;
+
+        fail_log)
+            _FAIL_LOG="$value"
+            ;;
+
+        aws_log)
+            _AWS_LOG="$value"
+            ;;
+
+        stat_srv_log)
+            _STAT_SRV_LOG="$value"
+            ;;
+
+        aws_cmd)
+            _AWS_CMD="$value"
+            ;;
+
+        chunk_size)
+            # Should be 1 MiB * 2^n
+            num_in_range "$value" 1048576 4294967296
+            if [ $? -ne 0 ]; then
+                print_line_num "$2"
+                add_log "*FATAL*\t\tConfiguration option 'chunk_size' invalid: '$value'\n"
+                exit 252
+            fi
+
+            # Check if valid multiple
+            local exp=0         # Starts at 2^0
+            local valid_size    # Loops as 1048576 * 2^exp
+            local valid=0       # Flag
+            while [ $exp -lt 65 ]; do
+                valid_size=$(( 1048576 * 2**exp ))
+                if [ $valid_size -eq "$value" ]; then
+                    valid=1
+                    break
+                fi
+                (( exp++ ))
+            done
+
+            if [ $valid -eq 0 ]; then
+                print_line_num "$2"
+                add_log "*FATAL*\t\tChunk size should be 1 MiB * 2^n (is $value)\n"
+                add_log "       \t\tTry 16777216 (16 MiB) if you're lost\n"
+                exit 252
+            fi
+            _CHUNK_SIZE="$value"
+            ;;
+
+        *)
+            print_line_num "$2"
+            add_log "*FATAL*\t\tUnknown config option '$setting'\n"
+            exit 252
+            ;;
+    esac
+}
+
+function ask_config {
+    # Helper for generate_config. Prompts user for input, and defaults to
+    # existing setting, or sane defaults if provided
+    # If no existing setting or sane default, retries
+    # Saves setting using set_config_option
+    # <setting_name> <prompt> <current_setting> <default_setting>
+
+    local default="" input
+
+    # Find default value for this setting if it exists
+    if [[ ! -z "$3" ]]; then
+        # First try current setting...
+        default="$3"
+    elif [[ ! -z "$4" ]]; then
+        # ... then try sane default...
+        default="$4"
+    fi
+
+    # Prompt user
+    if [ -z "$default" ]; then
+        printf -- "$2:\n> "
+    else
+        printf -- "$2:\n[ENTER: $default]\n> "
+    fi
+
+    read input
+
+    # Force if no existing or default
+    while [[ -z "$input" && -z "$default" ]]; do
+        printf -- "$2:\n[REQUIRED]\n> "
+        read input
+    done
+
+    # Assign default if necessary
+    if [[ -z "$input" ]]; then
+        input="$default"
+    fi
+
+    # Update config
+    set_config_option "$1=$input"
+}
+
+function save_config {
+    # Writes current config state to $_CONFIG_FILE, no confirmation
+
+    mkdir -p ~/.upload-glacier
+    printf "\
+# Generated by upload-glacier v$_UG_VERSION
+
+temp_dir=$_TEMP_DIR
+vault_name=$_VAULT_NAME
+tree_hash_cmd=$_TREE_HASH_CMD
+stat_srv_cmd=$_STAT_SRV_CMD
+stat_srv_port=$_STAT_SRV_PORT
+mail_cmd=$_MAIL_CMD
+
+overwrite_temps=$_OVERWRITE_TEMPS
+do_email=$_DO_EMAIL
+
+live_log=$_LIVE_LOG
+live_stats=$_LIVE_STATS
+reply_file=$_REPLY_FILE
+fail_log=$_FAIL_LOG
+aws_log=$_AWS_LOG
+stat_srv_log=$_STAT_SRV_LOG
+
+aws_cmd=$_AWS_CMD
+chunk_size=$_CHUNK_SIZE
+" >"$_CONFIG_FILE" || exit 253
+}
+
+function generate_config {
+    # Generates user config file, interactive
+    # No return or args, exits
+
+    # We can use sane defaults for _AWS_CMD, _TEMP_DIR, _CHUNK_SIZE, _MAIL_CMD, _STAT_SRV_PORT
+    # We absolutely need calc-sha256-treehash, ug-stat-srv.py, _VAULT_NAME
+
+    if [[ -f "$_CONFIG_FILE" && ! -w "$_CONFIG_FILE" ]]; then
+        printf "Config file '$_CONFIG_FILE' is not writable, check permissions\n"
+        printf "Aborting\n"
+        exit 253
+    fi
+
+    # If there's an existing config file, we can try loading it
+    if [ -r "$_CONFIG_FILE" ]; then
+        local resp
+        printf "Load existing settings and modify them?\n"
+        printf "Load will fail if config is invalid [Y/n/abort]: "
+        read -n 1 -r resp
+        printf "\n"
+
+        case "$resp" in
+            'n')
+                ;;
+
+            'a')
+                printf "\nAborting\n"
+                exit 1
+                ;;
+
+            *)
+                parse_config
+                ;;
+        esac
+    fi
+
+    # Read settings
+    printf "Setup requirements and instructions can be found at\n"
+    printf " http://www.mudeth.org/post/upload-glacier\n\n"
+
+    ask_config "temp_dir" "Temporary directory" "$_TEMP_DIR" "$_SANE_TEMP_DIR"
+    ask_config "vault_name" "Vault name" "$_VAULT_NAME" ""
+    ask_config "tree_hash_cmd" "Path to calc-sha256-treehash" "$_TREE_HASH_CMD" ""
+    ask_config "stat_srv_cmd" "Path to ug-stat-srv.py" "$_STAT_SRV_CMD" ""
+    ask_config "stat_srv_port" "Port for status server" "$_STAT_SRV_PORT" "$_SANE_STAT_SRV_PORT"
+    ask_config "mail_cmd" "Mail command (use \$s for \"subject\", \$t for \"text\")" "$_MAIL_CMD" "$_SANE_MAIL_CMD"
+    ask_config "aws_cmd" "AWS command" "$_AWS_CMD" "$_SANE_AWS_CMD"
+    ask_config "chunk_size" "Chunk size in bytes (must be 1 MiB * 2^n)" "$_CHUNK_SIZE" "$_SANE_CHUNK_SIZE"
+
+    printf "\nSaving and running sanity-check...\n"
+    save_config
+    add_log "-INFO-\t\tEnvironment check started\n"
+    environment_check "all" # Force check to run through all tests even if one fails
+    add_log "-INFO-\t\tEnvironment check finished\n"
+
+    exit 0
+}
+
+function parse_config {
+    # Parse config file. Run before command-line is parsed
+    # Prints to log, but _DO_EMAIL is usually not set at this point
+
+    if [ ! -r "$_CONFIG_FILE" ]; then
+        add_log "*FATAL*\t\tConfig file '$_CONFIG_FILE' not readable\n"
+        add_log "       \t\tRun with -G to configure\n"
+        exit 253
+    fi
+
+    local line line_num setting value
+
+    line_num=0
+    while IFS="\n" read line
+    do
+        (( line_num++ ))
+        # Trim leading whitespace
+        line=$(printf "$line" | awk '{ sub(/^ */, ""); print }')
+
+        # Ignore comments and blank lines
+        if [[ "${line:0:1}" == '#' || -z "$line" ]]; then
+            continue
+        fi
+
+        # Set it
+        set_config_option "$line" $line_num
+    done <"$_CONFIG_FILE"
+}
+
+function environment_check {
+    # Sets sane defaults for uninitialized config vars,
+    # Checks whether required programs are installed. if <verify_reqs> is "all", will run
+    # through all tests even if one fails. If it is non-null, will exit with first failure.
+    # Prints to log
+    # <verify_reqs> (default empty)
+
+    # Set uninitialized variables to sane defaults
+    if [ -z "$_TEMP_DIR" ]; then
+        set_config_option "temp_dir=$_SANE_TEMP_DIR"
+    fi
+
+    if [ -z "$_AWS_CMD" ]; then
+        set_config_option "aws_cmd=$_SANE_AWS_CMD"
+    fi
+
+    if [ -z "$_MAIL_CMD" ]; then
+        set_config_option "mail_cmd=$_SANE_MAIL_CMD"
+    fi
+
+    if [ -z "$_CHUNK_SIZE" ]; then
+        set_config_option "chunk_size=$_SANE_CHUNK_SIZE"
+    fi
+
+    if [ -z "$_STAT_SRV_PORT" ]; then
+        set_config_option "stat_srv_port=$_SANE_STAT_SRV_PORT"
+    fi
+
+    if [ -z "$1" ]; then
+        # Only set sane defaults, don't check dependencies, so return
+        return
+    fi
+
+    # Check that a vault is defined
+    if [ -z "$_VAULT_NAME" ]; then
+        add_log "*FATAL*\t\tVault name needs to be defined in config file\n"
+        add_log "       \t\tRun with -G to generate\n"
+        if [ ! "$1" == "all" ]; then
+            exit 252
+        fi
+    fi
+
+    # We need aws, recode, python, psutil, netaddr, _TREE_HASH_CMD, _STAT_SRV_CMD, _MAIL_CMD
+    type "$_AWS_CMD" >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        add_log "*FATAL*\t\tAWS command '$_AWS_CMD' not found\n"
+        if [ ! "$1" == "all" ]; then
+            exit 254
+        fi
+    fi
+
+    type "recode" >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        add_log "*FATAL*\t\trecode not installed\n"
+        if [ ! "$1" == "all" ]; then
+            exit 254
+        fi
+    fi
+
+    type "python" >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        add_log "*ERROR*\t\tpython not installed, what in the...\n"
+        if [ ! "$1" == "all" ]; then
+            exit 254
+        fi
+    fi
+
+    # Python found, check modules
+    python -c "import psutil" >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        add_log "*WARNING*\tpsutil module not installed, status server will not work\n"
+    fi
+
+    python -c "import netaddr" >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        add_log "*WARNING*\tnetaddr module not installed, status server will not work\n"
+    fi
+
+    # Check that treehash calculator and status server are executable
+    if [ ! -x "$_TREE_HASH_CMD" ]; then
+        add_log "*FATAL*\t\tTreehash calculator '$_TREE_HASH_CMD' is not executable\n"
+        if [ ! "$1" == "all" ]; then
+            exit 254
+        fi
+    fi
+
+    if [ ! -x "$_STAT_SRV_CMD" ]; then
+        add_log "*WARNING*\tStatus server '$_STAT_SRV_CMD' is not executable\n"
+    fi
+}
+
+function complete_upload {
+    # Finished upload and informs user of errors, error-checks
+    # Does not notify user on success, check return-code when called
+    # <treehash> <filesize> <uploadId>
+
+    if [ $# -ne 3 ]; then
+        add_log "\nINTERNAL FAULT: complete_upload expects 3 arguments, got $#\n"
+        exit 255
+    fi
+
+    local tree_hash="$1"
+    local filesize="$2"
+    local uid="$3"
+
+    "$_AWS_CMD" glacier complete-multipart-upload --checksum "$tree_hash" --archive-size "$filesize" --upload-id "$uid" --account-id - --vault-name "$_VAULT_NAME" > "$_REPLY_FILE" 2>&1
+    local aws_ret=$?
+    cat "$_REPLY_FILE" >> "$_AWS_LOG"
+    local archive_id=`< "$_REPLY_FILE" awk '-F[\t \n,]' '/archiveId/ { for (x=1;x<=NF; x++) if ($x~"archiveId") { sub(/^"/, "", $(x+1)); sub(/"$/, "", $(x+1)); print $(x+1) } }'`
+
+    if [ $aws_ret -ne 0 ]; then
+        # Could not complete upload?
+        add_log "*ERROR*\t\t$_AWS_CMD returned $aws_ret. Upload had errors. Hash failed?\n"
+        return 255
+    else
+        if [ -z "$archive_id" ]; then
+            # AWS was successful, but couldn't parse upload ID!
+            add_log "*WARNING*\t$_AWS_CMD returned $aws_ret but could not parse output for Archive ID\n"
+            return 1
+        else
+            # Completed successfully, clean up
+            add_log "Archive ID:\t$archive_id\n"
+            rm "$_TEMP_DIR/$uid.treehash" "$_TEMP_DIR/$uid.size"
+            return 0
+        fi
+    fi
+}
+
+function send_log {
+    # Sends out e-mail when exiting - trap handler
+    # No args
+
+    if [[ "$_DO_EMAIL" -eq 1 && "$_LIVE_LOG_ON" -ne 0 ]]; then
+        _MAIL_TITLE=`printf "$_RUN_DATE" | awk '{ print $2,$3,$6 }'`
+
+        if [ -z "$_MAIL_CMD" ]; then
+            add_log "*WARNING*\tNo mail command specified\n"
+        elif [[ ! -z "$_MAIL_TEXT" ]]; then
+            # Ready mail string
+            local mail_exec_str
+            mail_exec_str=$(printf -- "$_MAIL_CMD" | awk -v "subject=\"Glacier upload for $_MAIL_TITLE\"" -v "text=\"$_MAIL_TEXT\"" \
+                '{ gsub(/\$s/, subject); gsub(/\$t/, text); print }')
+
+            # Run it
+            eval "$mail_exec_str"
+        else
+            add_log "No mail to send\n"
+        fi
+    fi
+
+    # Signal to server that job is over so that it can die gracefully
+    if [ "$_STAT_SRV_PID" -ne 0 ]; then
+        kill -USR1 "$_STAT_SRV_PID"
+        if [ $? -ne 0 ]; then
+            add_log "*WARNING*\tCould not kill status server ($_STAT_SRV_PID). Did it crash?\n"
+        fi
+    fi
+}
+
+function failed_chunk {
+    # Log a failed chunk for retrying later
+    # <upload_id> <chunk_file> <range>
+
+    if [ $# -ne  3 ]; then
+        add_log "\nINTERNAL FAULT: failed_chunk expects 3 arguments, got $#\n"
+        exit 255
+    fi
+
+    printf -- "%s\n%s\n%s\n" "$1" "$2" "$3" >> "$_FAIL_LOG"
+}
+
+# Check usage
+
+if [[ $# -lt 1 && ! -f "$_FAIL_LOG" ]]; then
+    # No arguments? No need for recovery mode?
+    # Print usage and exit
+    printf "Multipart upload a file to Amazon Glacier\n$_USAGE_TEXT"
+    exit 0
+fi
+
+# Standalone arguments first
+if [ "$1" == "-G" ]; then
+    generate_config
+    shift   # Exits before this, just for safety
+fi
+
+parse_config
+
+# Handle arguments
+
+_FIRST_CHAR=${1:0:1}
+while [ "$_FIRST_CHAR" == '-' ]; do
+    case ${1:1:1} in
+    '-')    # End of options
+        shift
+        break
+        ;;
+
+    'a')    # Alternate aws command
+        if [ -z "$2" ]; then
+            printf "--" "-a requires an argument\n$_USAGE_TEXT"
+            exit 1
+        fi
+        set_config_option "aws_cmd=$2"
+        shift 2
+        ;;
+
+    'c')    # Change chunk size
+        if [ -z "$2" ]; then
+            printf "--" "-a requires an argument\n$_USAGE_TEXT"
+            exit 1
+        fi
+        set_config_option "chunk_size=$2"
+        shift 2
+        ;;
+
+    'C')    # Exec config file
+        if [ -z "$2" ]; then
+            printf "--" "-C requires an argument\n$_USAGE_TEXT"
+            exit 1
+        fi
+        _CONFIG_FILE="$2"
+        parse_config
+        shift 2
+        ;;
+
+    'e')    # E-mail notification on
+        set_config_option "do_email=1"
+        shift
+        ;;
+
+    'E')    # Test environment
+        add_log "-INFO-\t\tEnvironment check started\n"
+        environment_check "all"
+        add_log "-INFO-\t\tEnvironment check finished\n"
+        exit 0
+        ;;
+
+    'G')    # Generate config (interactive)
+        add_log "-G needs to be run without any other arguments\n"
+        shift
+        exit 1
+        ;;
+
+    'l')    # List current settings and exit
+        environment_check   # Empty $1 means it won't check dependencies, only set defaults
+        add_log "Version:        $_UG_VERSION ($_UG_DATE)\n"
+        add_log "Config file:    $_CONFIG_FILE\n"
+        add_log "Vault name:     $_VAULT_NAME\n"
+        add_log "Chunk size:     "
+            add_log_bytes $_CHUNK_SIZE
+            add_log " bytes\n\n"
+
+        add_log "Temporary dir:  $_TEMP_DIR\n"
+        add_log "AWS command:    $_AWS_CMD\n"
+        add_log "Live log at:    $_LIVE_LOG\n"
+        add_log "AWS log at:     $_AWS_LOG\n"
+        add_log "AWS reply at:   $_REPLY_FILE\n"
+        add_log "Fail log at:    $_FAIL_LOG\n"
+        add_log "Server log at:  $_STAT_SRV_LOG\n"
+        add_log "Status file:    $_LIVE_STATS\n\n"
+
+        add_log "Mail command:   $_MAIL_CMD\n"
+        add_log "Treehash calc:  $_TREE_HASH_CMD\n"
+        add_log "Status server:  $_STAT_SRV_CMD\n"
+        add_log "Server port:    $_STAT_SRV_PORT\n\n"
+
+        add_log "Send E-mail:    $_DO_EMAIL\n"
+        add_log "Overwrite tmps: $_OVERWRITE_TEMPS\n"
+        shift
+        exit 0
+        ;;
+
+    'n')    # E-mail notification off
+        set_config_option "do_email=0"
+        shift
+        ;;
+
+    'r')    # Run recovery mode
+        _RECOVERY=1
+        shift
+        ;;
+
+    't')    # Alternate temp dir specified
+        if [ -z "$2" ]; then
+            printf "--" "-t requires an argument\n$_USAGE_TEXT"
+            exit 1
+        fi
+        set_config_option "temp_dir=$2"
+        shift 2
+        ;;
+
+    'v')    # Print version and exit
+        printf "upload-glacier v$_UG_VERSION ($_UG_DATE)\n"
+        shift
+        exit 0
+        ;;
+
+    'V')    # Use specified vault
+        if [ -z "$2" ]; then
+            printf "--" "-V requires an argument\n$_USAGE_TEXT"
+            exit 1
+        fi
+        set_config_option "vault_name=$2"
+        shift 2
+        ;;
+
+    *)      # Unknown
+        printf "--" "Unknown option $1\n$_USAGE_TEXT"
+        shift
+        exit 1
+        ;;
+    esac
+
+    _FIRST_CHAR=${1:0:1}
+done
+
+if [[ $# -eq 0 && $_RECOVERY -eq 0 ]]; then
+    # No files
+    printf "No files specified\n$_USAGE_TEXT"
+    exit 1
+fi
+
+_FILES_UPLOADED=0
+_TOTAL_FILESIZE=0
+_TIME_TAKEN=0
+
+# Register exit trap
+trap send_log EXIT
+
+# Main entry starts here ###############################
+#
+# Logging only happens after this point
+# Create temp directory
+
+environment_check "verify"  # Non-empty $1 means it'll check programs and bail if not found
+
+mkdir -p "$_TEMP_DIR"
+if [ $? -ne 0 ]; then
+    add_log "*FATAL*\t\tError creating temporary directory\nBailing\n"
+    exit 2
+fi
+
+# Log should be writable now; turn it on
+_LIVE_LOG_ON=1
+> "$_LIVE_LOG"
+
+# Log debug stuff
+add_log "upload-glacier v$_UG_VERSION\n"
+add_log "Started at:    $_RUN_DATE\n"
+add_log "Vault name:    $_VAULT_NAME\n"
+add_log "Chunk size:    "
+    add_log_bytes $_CHUNK_SIZE
+    add_log " bytes\n"
+add_log "AWS command:   $_AWS_CMD\n"
+add_log "Temporary dir: $_TEMP_DIR\n"
+
+printf -- "\n$_RUN_DATE ---------------------------------------------------\n" >> "$_AWS_LOG"
+
+# Check if reply file is writable for us
+touch "$_REPLY_FILE"
+if [ ! -w "$_REPLY_FILE" ]; then
+    add_log "*FATAL*\t\t$_REPLY_FILE is not writable, check permissions\nBailing\n"
+    exit 2
+fi
+
+# If fail log found, print warning ###############################
+#
+
+if [ -f "$_FAIL_LOG" ]; then
+    add_log "\n*WARNING*\tSome chunks from an older session were not uploaded correctly\n"
+    add_log "         \tRun $0 -r to recover them\n\n"
+fi
+
+# Branch for recovery mode ########################################
+
+if [ $_RECOVERY -ne 0 ]; then
+    add_log "\n----------------------------------------------------------------------\n"
+    add_log "** RECOVERY MODE **\n"
+    declare -A _PROCESSED_UIDS            # Hash array of all uploadIds processed in recovery mode; contains a(ny) chunk file name from that uid
+
+    if [ ! -t 1 ]; then
+        # Not in terminal, start recovery mode only interactively
+        add_log "Recovery mode has to be run from terminal. Quitting\n"
+        exit 2
+    fi
+
+    if [ $# -ne 0 ]; then
+        add_log "Warning: specified file(s) '$*' will not be uploaded in this sesion\n"
+        printf "Only previous failed uploads will be re-tried. Do you want to continue? [y/N]: "
+        local resp
+        read -n 1 -r resp
+        printf "\n"
+
+        case "$resp" in
+            y)
+                ;;
+            *)
+                printf "Aborting\n"
+                exit 1
+                ;;
+        esac
+    fi
+
+    _UPLOAD_ID=""
+    _CHUNK_FILE=""
+    _RANGE=""
+
+    start_stat_srv
+
+    if [ ! -f "$_FAIL_LOG" ]; then
+        add_log "*ERROR*\t\tNo fail log exists at $_FAIL_LOG, aborting\n"
+        exit 255
+    fi
+
+    > "${_FAIL_LOG}.new"    # Clear secondary fail log
+
+    # Run through fail log
+    while IFS='' read -r _UPLOAD_ID || [[ -n "$_LINE" ]]; do
+        # Get sets of 3
+        IFS='' read -r _CHUNK_FILE
+        IFS='' read -r _RANGE
+
+        if [[ -z "$_UPLOAD_ID" || -z "$_CHUNK_FILE" || -z "$_RANGE" ]]; then
+            # Something's wrong with one of them
+            add_log "*FATAL*\t\tError reading failure log $_FAIL_LOG\n"
+            add_log "       \t\tat '$_UPLOAD_ID', '$_CHUNK_FILE', '$_RANGE' (upload ID, chunk file, range)\n"
+            exit 255
+        fi
+
+        if [ ! -f "$_TEMP_DIR/$_UPLOAD_ID.treehash" ]; then
+            # This upload has failed, but there's no hash stored; weird. Bail
+            add_log "*FATAL*\t\tCould not find saved treehash for '$_UPLOAD_ID'\n"
+            exit 255
+        fi
+
+        if [ ! -f "$_TEMP_DIR/$_UPLOAD_ID.size" ]; then
+            # This upload has failed, but there's no size stored; still weird
+            add_log "*FATAL*\t\tCould not find saved size for '$_UPLOAD_ID'\n"
+            exit 255
+        fi
+
+        # Add to processed uploadIds list; if uploads are successful, we can compete upload later
+        if [ -z "${_PROCESSED_UIDS[$_UPLOAD_ID]}" ]; then
+            # New entry
+            add_log "\n----------------------------------------------------------------------\n"
+            add_log "Upload ID:   $_UPLOAD_ID\n"
+            _PROCESSED_UIDS["$_UPLOAD_ID"]="$_CHUNK_FILE"
+        fi
+
+        # Update web server with useless stuff, but at least you can read the log
+        update_stats "reserved" "$_CHUNK_FILE" 0 0 0 "$_UPLOAD_ID" 0 0
+
+        # Try uploading again
+        add_log "- $_CHUNK_FILE\n"
+        "$_AWS_CMD" glacier upload-multipart-part --upload-id "$_UPLOAD_ID" --body "$_CHUNK_FILE" --range "$_RANGE" --account-id - --vault-name "$_VAULT_NAME" >> "$_AWS_LOG" 2>&1
+        _AWS_RET=$?
+
+        if [ $_AWS_RET -ne 0 ]; then
+            # Failed again, add to secondary fail log
+            printf "$_UPLOAD_ID\n$_CHUNK_FILE\n$_RANGE\n" >> "${_FAIL_LOG}.new"
+            add_log "  [FAILED] with exit code $_AWS_RET\n"
+        else
+            # Chunk successfully uploaded
+            add_log "  [OK]\n"
+            rm "$_CHUNK_FILE"
+        fi
+    done < "$_FAIL_LOG"
+
+    # Complete multipart-upload for completed uploadIds
+    add_log "\n----------------------------------------------------------------------\n"
+    add_log "Completing any successful recoveries\n"
+    _WARN_TEXT=""
+    for _UID in "${!_PROCESSED_UIDS[@]}"; do
+        grep -q -- "$_UID" "${_FAIL_LOG}.new"
+        if [ $? -ne 0 ]; then
+            # uploadId not found in new fail log; we can complete this!
+            _TREE_HASH=`cat "$_TEMP_DIR/$_UID.treehash"`
+            _FILESIZE=`cat "$_TEMP_DIR/$_UID.size"`
+
+            add_log "\nCompleting:\t$_UID\n"
+            complete_upload "$_TREE_HASH" "$_FILESIZE" "$_UID"
+            if [ $? -eq 0 ]; then
+                # All OK
+                add_log "+SUCCESS+\trecovered and committed upload\n"
+
+                # Remove containing temp sub-directory
+                _FILE_NAME_ONLY=`printf "${_PROCESSED_UIDS[$_UID]}" | awk -F '/' '{ for (i=1; i<NF;++i) { printf "%s", $i; if ( i != (NF-1) ) printf "/";} }'`
+                rmdir "$_FILE_NAME_ONLY"
+            else
+                _WARN_TEXT=", but some commits failed"
+            fi
+        fi
+
+        # At least give chunk name for *some* info
+        update_stats "reserved" "${_PROCESSED_UIDS[$_UID]}" 0 0 0 "$_UID" 0 0
+    done
+
+    add_log "\n----------------------------------------------------------------------\n"
+    # Check if we have new fails, update fail log if so
+    if [ -s "${_FAIL_LOG}.new" ]; then
+        add_log "Some failures, updating fail log. Run recovery again to retry\n"
+        mv -f "${_FAIL_LOG}.new" "$_FAIL_LOG"
+        update_stats "reserved" "$_CHUNK_FILE" 1 1 0 "Not completed" 1 1
+        exit 100
+    else
+        add_log "Recovery completed successfully$_WARN_TEXT\n"
+        update_stats "reserved" "$_CHUNK_FILE" 1 1 0 "Completed" 1 1
+        rm "${_FAIL_LOG}.new"
+        rm "$_FAIL_LOG"
+        exit 0
+    fi
+fi
+
+# End recovery mode; normal operation begins here
+##################################################################
+
+start_stat_srv
+
+# Run through the files
+_CUR_FILE=0
+_TOTAL_FILES=$#
+for _FILENAME in "$@"; do
+    add_log "\n----------------------------------------------------------------------\n"
+    add_log "$_FILENAME: "
+    _START_DATE_FILE=`date +%s`
+    (( _CUR_FILE++ ))
+
+    # Check if file exists and is readable
+    if [ ! -f "$_FILENAME" ]; then
+        add_log "error: does not exist, skipping\n"
+        continue
+    fi
+
+    if [ ! -r "$_FILENAME" ]; then
+        add_log "error: is not readable, skipping\n"
+        continue
+    fi
+
+    # Check file size and permissions
+    _FILESIZE=`du -b "$_FILENAME" | cut -f 1`
+    if [ $? -ne 0 ]; then
+        add_log "error: could not get filesize, skipping\n"
+        continue
+    fi
+
+    _FILE_NAME_ONLY=`printf "$_FILENAME" | awk -F/ '{ print $NF }'`        # Extract only last portion of filename
+
+    # Check if file is being processed already
+    if [ -d "$_TEMP_DIR/$_FILE_NAME_ONLY" ] && [ $_OVERWRITE_TEMPS -eq 0 ]; then
+        add_log "\n*ERROR*\t\t$_TEMP_DIR/$_FILE_NAME_ONLY already exists, skipping\n"
+        continue
+    fi
+
+    # Now is a good time to update stat_server; split might take a while
+    update_stats "reserved" "$_FILENAME" $_CUR_FILE $_TOTAL_FILES "$_FILESIZE" "[ Preparing file... ]" 0 0
+
+    # Create temporary directory for split file
+    mkdir -p "$_TEMP_DIR/$_FILE_NAME_ONLY"                    # Failed creating temp sub-directory?
+    if [ $? -ne 0 ]; then
+        add_log "error: could not create temp sub-dir $_TEMP_DIR/$_FILE_NAME_ONLY; skipping\n"
+        continue
+    fi
+
+    # Split the damn file
+    _TEMP_FILENAME="$_TEMP_DIR/$_FILE_NAME_ONLY/$_FILE_NAME_ONLY"        # Temp filename
+    split "--bytes=$_CHUNK_SIZE" "$_FILENAME" "$_TEMP_FILENAME"        # Split ze file
+    if [ $? -ne 0 ]; then
+        add_log "*ERROR*\t\tsplit failed($?) to $_TEMP_FILENAME; skipping\n"
+        continue
+    fi
+
+    # Create upload request
+    _DESC=`generate_description "$_FILENAME" "$_FILESIZE"`    # FastGlacier compatible XML description
+    #echo  "$_AWS_CMD" glacier initiate-multipart-upload --account-id - --archive-description "$_DESC" --part-size "$_CHUNK_SIZE" --vault-name "$_VAULT_NAME" > "$_REPLY_FILE.cmd" 2>&1
+    "$_AWS_CMD" glacier initiate-multipart-upload --account-id - --archive-description "$_DESC" --part-size "$_CHUNK_SIZE" --vault-name "$_VAULT_NAME" > "$_REPLY_FILE" 2>&1
+    cat "$_REPLY_FILE" >> "$_AWS_LOG"
+    _UPLOAD_ID=`cat "$_REPLY_FILE" | awk '-F[\t \n,]' '/uploadId/ { for (x=1;x<=NF; x++) if ($x~"uploadId") { sub(/^"/, "", $(x+1)); sub(/"$/, "", $(x+1)); print $(x+1) } }'`
+    if [[ -z "$_UPLOAD_ID" ]]; then
+        add_log "\n*ERROR*\t\tcould not parse uploadId from AWS reply; skipping\n"
+        continue
+    fi
+
+    # Calculate tree hash
+    _TREE_HASH=`"$_TREE_HASH_CMD" "$_FILENAME"`
+    if [ $? -ne 0 ]; then
+        add_log "*ERROR*\t\tgetting tree hash, skipping\n"
+    fi
+
+    # Store hash and filesize in case we need to re-upload chunks in recovery mode later
+    printf "$_TREE_HASH" > "$_TEMP_DIR/$_UPLOAD_ID.treehash"
+    printf "$_FILESIZE" > "$_TEMP_DIR/$_UPLOAD_ID.size"
+
+    # Prep was successful
+    add_log "OK, "
+        add_log_bytes $_FILESIZE
+        add_log " bytes\n\n"
+
+    add_log "Upload ID:\t$_UPLOAD_ID\n"
+    add_log "Tree hash:\t$_TREE_HASH\n"
+    add_log "Started at:\tEPOCH + $_START_DATE_FILE\n"
+
+    # Start uploading
+    shopt -s nullglob       # Prevent matching '*'
+    _ITER=0
+    _FAIL_FLAG=0            # If any of the chunks fail
+
+    (( _TOTAL_CHUNKS = $_FILESIZE / $_CHUNK_SIZE ))
+    if (( $_FILESIZE % $_CHUNK_SIZE != 0 )); then
+        # One last teeny chunk you integers forgot about yo
+        (( _TOTAL_CHUNKS++ ))
+    fi
+    for _CHUNK_FILE in "$_TEMP_DIR/$_FILE_NAME_ONLY/$_FILE_NAME_ONLY"*; do
+        # For each chunk
+        (( _ITER_PLUS = $_ITER + 1 ))
+
+        # Update stats for web-server
+        update_stats "reserved" "$_FILENAME" $_CUR_FILE $_TOTAL_FILES "$_FILESIZE" "$_UPLOAD_ID" $_ITER_PLUS $_TOTAL_CHUNKS
+
+        if [ -t 1 ]; then
+            # Print progress if on terminal
+            printf "  [ $_ITER_PLUS / $_TOTAL_CHUNKS ]\r"
+        fi
+
+        _CHUNK_FILE_SIZE=`du -b "$_CHUNK_FILE" | cut -f 1`
+        (( _START_BYTE = $_ITER * $_CHUNK_SIZE ))
+        (( _END_BYTE = $_START_BYTE + $_CHUNK_FILE_SIZE - 1 ))
+        _RANGE="bytes ${_START_BYTE}-${_END_BYTE}/*"
+
+        _CHUNK_HASH=`"$_TREE_HASH_CMD" "$_CHUNK_FILE"`
+        if [ $? -ne 0 ]; then
+            # Could not get checksum fir chunk?
+            add_log "  *WARNING*:\tchunk $_ITER_PLUS: failed getting checksum\n"
+            "$_AWS_CMD" glacier upload-multipart-part --upload-id "$_UPLOAD_ID" --body "$_CHUNK_FILE" --range "$_RANGE" --account-id - --vault-name "$_VAULT_NAME" >> "$_AWS_LOG" 2>&1
+            _AWS_RET=$?
+        else
+            "$_AWS_CMD" glacier upload-multipart-part --upload-id "$_UPLOAD_ID" --checksum "$_CHUNK_HASH" --body "$_CHUNK_FILE" --range "$_RANGE" --account-id - --vault-name "$_VAULT_NAME" >> "$_AWS_LOG" 2>&1
+            _AWS_RET=$?
+        fi
+
+        case $_AWS_RET in
+            0)    # Success, remove chunk file
+                (( _TOTAL_FILESIZE += $_CHUNK_FILE_SIZE ))
+                rm "$_CHUNK_FILE"
+                ;;
+
+            2)    # Failed to be parsed? Weird - malformed syntax
+                if [ -t 1 ]; then
+                    printf "\n"
+                fi
+                add_log "  * Chunk $_ITER_PLUS failed: MALFORMED?: $_AWS_CMD returned 2: failure to parse\n"
+                ((_FAIL_FLAG++))
+                ;;
+
+            *)    # Other error
+                if [ -t 1 ]; then
+                    printf "\n"
+                fi
+                add_log "  * Chunk $_ITER_PLUS: '$_CHUNK_FILE' failed, run recovery to retry\n"
+                failed_chunk "$_UPLOAD_ID" "$_CHUNK_FILE" "$_RANGE"
+                ((_FAIL_FLAG++))
+                ;;
+        esac
+
+        ((_ITER++))
+    done
+    shopt -u nullglob    # Back to defaults
+
+    # Upload was processed, check if successful
+
+    _END_DATE_FILE=`date +%s`
+    (( _TIME_TAKEN_FILE = $_END_DATE_FILE - $_START_DATE_FILE ))
+    (( _TIME_TAKEN += $_TIME_TAKEN_FILE ))
+    add_log "\n"
+
+    if [ $_FAIL_FLAG -ne 0 ]; then
+        # Errors, don't delete folder
+        add_log "*ERROR*\t\t$_FAIL_FLAG error(s), took $_TIME_TAKEN_FILE second(s)\n"
+    else
+        # Success, complete the upload
+        complete_upload "$_TREE_HASH" "$_FILESIZE" "$_UPLOAD_ID"
+        _AWS_RET=$?
+        if [ $_AWS_RET -ne 0 ]; then
+            # Error committing upload
+            continue
+        fi
+
+        # All OK, remove temp sub-dir and update counts
+        rmdir "$_TEMP_DIR/$_FILE_NAME_ONLY"
+        (( _FILES_UPLOADED++ ))
+        add_log "+SUCCESS+\tTook $_TIME_TAKEN_FILE second(s)\n"
+    fi
+
+done
+
+_END_DATE=`date`
+add_log "----------------------------------------------------------------------\n"
+add_log "Started at:\t$_RUN_DATE\n"
+add_log "Finished at:\t$_END_DATE\n"
+add_log "$_FILES_UPLOADED file(s) processed successfully\n"
+add_log_bytes $_TOTAL_FILESIZE
+    add_log " bytes uploaded\n"
+
+exit 0
