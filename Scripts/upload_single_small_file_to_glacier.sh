@@ -1,4 +1,5 @@
 #!/bin/sh
+#script to uplaod small files to amazon glacier 
 # variables for vault name, timestamp, and output file
 VAULT="sandbox-02"
 NOW=$(date +%s)
